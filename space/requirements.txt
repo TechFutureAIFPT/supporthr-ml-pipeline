@@ -1,0 +1,7 @@
+# Runtime-only deps for the HF Space. scikit-learn must match the version the
+# model was trained with (see training_metadata.json) or joblib.load may fail.
+fastapi==0.115.12
+uvicorn[standard]==0.34.2
+pydantic==2.11.4
+scikit-learn==1.6.1
+joblib==1.5.0

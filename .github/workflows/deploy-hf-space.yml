@@ -1,0 +1,215 @@
+name: Deploy classifier to Hugging Face Space
+
+# Train -> quality gate -> smoke test -> mirror to a Docker Space.
+# Required repo settings (Settings > Secrets and variables > Actions):
+#   secret   HF_TOKEN            HF write token of the Space owner
+#   secret   CLASSIFIER_API_KEY  shared key, same value as LOCAL_CLASSIFIER_REMOTE_API_KEY on the main API
+#   variable HF_SPACE_ID         e.g. <hf-username>/supporthr-classifier
+on:
+  push:
+    branches: [main]
+    paths:
+      - "server.py"
+      - "scripts/train_classifier.py"
+      - "data/raw/kaggle-csv-bulk/Resume/**"
+      - "space/**"
+      - ".github/workflows/deploy-hf-space.yml"
+  pull_request:
+    paths:
+      - "server.py"
+      - "scripts/train_classifier.py"
+      - "space/**"
+      - ".github/workflows/deploy-hf-space.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hf-space-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.11"
+  DATASET_CSV: data/raw/kaggle-csv-bulk/Resume/Resume.csv
+  MIN_ACCURACY: "0.60"
+  STAGE_DIR: ${{ github.workspace }}/.space-build
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out only what the Space needs
+        uses: actions/checkout@v7
+        with:
+          sparse-checkout: |
+            server.py
+            scripts
+            space
+            data/raw/kaggle-csv-bulk/Resume
+          sparse-checkout-cone-mode: false
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: space/requirements.txt
+
+      - name: Install training + runtime deps
+        run: pip install -r space/requirements.txt pandas httpx
+
+      - name: Stage Space files
+        run: |
+          set -euo pipefail
+          mkdir -p "$STAGE_DIR/models"
+          cp space/Dockerfile space/README.md space/requirements.txt server.py "$STAGE_DIR/"
+
+      - name: Train classifier
+        run: |
+          python scripts/train_classifier.py \
+            --dataset-csv "$DATASET_CSV" \
+            --model-output "$STAGE_DIR/models/text_classifier_model.pkl" \
+            --report-output "$STAGE_DIR/models/classification_report.txt" \
+            --metadata-output "$STAGE_DIR/models/training_metadata.json"
+
+      - name: Quality gate
+        run: |
+          python - <<'PY'
+          import json, os, sys, sklearn
+          meta_path = os.path.join(os.environ["STAGE_DIR"], "models", "training_metadata.json")
+          meta = json.load(open(meta_path, encoding="utf-8"))
+          acc = float(meta["report"]["accuracy"])
+          labels = int(meta["label_count"])
+          minimum = float(os.environ["MIN_ACCURACY"])
+          meta["sklearn_version"] = sklearn.__version__
+          meta["git_sha"] = os.environ["GITHUB_SHA"]
+          json.dump(meta, open(meta_path, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+          print(f"accuracy={acc:.4f} labels={labels} sklearn={sklearn.__version__}")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as fh:
+              fh.write(f"### Classifier\n- accuracy: **{acc:.4f}** (gate {minimum})\n- labels: {labels}\n")
+          if labels != 24 or acc < minimum:
+              sys.exit(f"Quality gate failed: accuracy={acc:.4f}, labels={labels}")
+          PY
+
+      - name: Smoke test staged service
+        working-directory: ${{ env.STAGE_DIR }}
+        env:
+          CLASSIFIER_API_KEY: ci-smoke-key
+          CLASSIFIER_ALLOW_SEED_FALLBACK: "0"
+          MODEL_PATH: models/text_classifier_model.pkl
+        run: |
+          set -euo pipefail
+          uvicorn server:app --host 127.0.0.1 --port 7860 > uvicorn.log 2>&1 &
+          for _ in $(seq 1 30); do curl -fsS http://127.0.0.1:7860/health >/dev/null 2>&1 && break; sleep 1; done
+          python - <<'PY'
+          import httpx
+          base = "http://127.0.0.1:7860"
+          h = {"X-Classifier-Key": "ci-smoke-key"}
+          assert httpx.get(f"{base}/api/cv/classifier-status").status_code == 401, "status must require key"
+          status = httpx.get(f"{base}/api/cv/classifier-status", headers=h).json()
+          assert status["ready"] and status["label_count"] == 24, status
+          r = httpx.post(f"{base}/api/cv/classify-industry", headers=h,
+                         json={"cv_text": "Head chef with 8 years kitchen management, menu design, pastry and culinary team leadership", "top_k": 3})
+          r.raise_for_status()
+          body = r.json()
+          print(body)
+          assert body["predicted_label"] == "CHEF" and len(body["top_predictions"]) == 3, body
+          PY
+          kill %1 || true
+          rm -f uvicorn.log
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: hf-space-bundle
+          path: ${{ env.STAGE_DIR }}
+          retention-days: 7
+
+  deploy:
+    needs: build
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    environment:
+      name: huggingface
+      url: ${{ steps.publish.outputs.space_url }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: hf-space-bundle
+          path: space-bundle
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Validate settings
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          CLASSIFIER_API_KEY: ${{ secrets.CLASSIFIER_API_KEY }}
+          HF_SPACE_ID: ${{ vars.HF_SPACE_ID }}
+        run: |
+          : "${HF_TOKEN:?Missing secret HF_TOKEN}"
+          : "${CLASSIFIER_API_KEY:?Missing secret CLASSIFIER_API_KEY}"
+          [[ "$HF_SPACE_ID" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] \
+            || { echo "Variable HF_SPACE_ID must look like <user>/<space>"; exit 1; }
+
+      - name: Publish to Space and wait until running
+        id: publish
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          CLASSIFIER_API_KEY: ${{ secrets.CLASSIFIER_API_KEY }}
+          HF_SPACE_ID: ${{ vars.HF_SPACE_ID }}
+        run: |
+          pip install -q "huggingface_hub>=0.30" httpx
+          python - <<'PY'
+          import os, time, httpx
+          from huggingface_hub import HfApi
+
+          api = HfApi(token=os.environ["HF_TOKEN"])
+          repo_id = os.environ["HF_SPACE_ID"]
+          sha = os.environ["GITHUB_SHA"][:12]
+
+          api.create_repo(repo_id, repo_type="space", space_sdk="docker", exist_ok=True, private=False)
+          api.add_space_secret(repo_id, "CLASSIFIER_API_KEY", os.environ["CLASSIFIER_API_KEY"])
+          api.add_space_variable(repo_id, "MODEL_SOURCE", f"hf-space://{repo_id}@{sha}")
+          api.upload_folder(
+              repo_id=repo_id, repo_type="space", folder_path="space-bundle",
+              commit_message=f"Deploy {os.environ['GITHUB_REPOSITORY']}@{sha}",
+              delete_patterns=["*"],  # mirror: remove files no longer in the bundle
+          )
+
+          info = api.space_info(repo_id)
+          host = getattr(info, "host", None) or "https://" + repo_id.lower().replace("/", "-").replace("_", "-").replace(".", "-") + ".hf.space"
+          with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+              fh.write(f"space_url={host}\n")
+
+          deadline = time.time() + 15 * 60
+          stage = "?"
+          while time.time() < deadline:
+              stage = api.get_space_runtime(repo_id).stage
+              if stage == "RUNNING":
+                  break
+              if stage in {"BUILD_ERROR", "RUNTIME_ERROR", "CONFIG_ERROR"}:
+                  raise SystemExit(f"Space failed with stage {stage}: check build logs on huggingface.co/spaces/{repo_id}")
+              time.sleep(15)
+          else:
+              raise SystemExit(f"Space not running after 15 min (stage={stage})")
+
+          headers = {"X-Classifier-Key": os.environ["CLASSIFIER_API_KEY"]}
+          for _ in range(20):
+              try:
+                  r = httpx.get(f"{host}/api/cv/classifier-status", headers=headers, timeout=20)
+                  if r.status_code == 200 and r.json().get("ready"):
+                      print("Live:", r.json()["model_source"])
+                      break
+              except httpx.HTTPError:
+                  pass
+              time.sleep(10)
+          else:
+              raise SystemExit("Space is RUNNING but classifier-status is not ready")
+
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as fh:
+              fh.write(f"### Deployed\n- Space: https://huggingface.co/spaces/{repo_id}\n"
+                       f"- LOCAL_CLASSIFIER_REMOTE_CLASSIFY_URL = `{host}/api/cv/classify-industry`\n")
+          PY
