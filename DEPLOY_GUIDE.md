@@ -47,3 +47,23 @@ Script sẽ tự động khởi động `server.py`, mở Cloudflare Tunnel HTTP
 1. Mở [Kaggle](https://www.kaggle.com/) > **Code** > **New Notebook** > Import file `kaggle_classifier.ipynb`.
 2. Gắn dataset `resume dataset` (tùy chọn để huấn luyện trên dữ liệu thật).
 3. Chọn **Run all** và lấy URL HTTPS.
+
+---
+
+## 4. Hugging Face Space (production)
+
+Workflow `.github/workflows/deploy-hf-space.yml` chạy khi push `main`:
+train từ `data/raw/kaggle-csv-bulk/Resume/Resume.csv` → quality gate (accuracy ≥ 0.60, đủ 24 nhãn)
+→ smoke test → đẩy `space/` + `server.py` + model lên Space (Docker SDK, port 7860).
+
+Cấu hình một lần trong GitHub repo này (Settings → Secrets and variables → Actions):
+
+| Loại | Tên | Giá trị |
+| --- | --- | --- |
+| Secret | `HF_TOKEN` | HF access token quyền **Write** |
+| Secret | `CLASSIFIER_API_KEY` | chuỗi ngẫu nhiên, vd `openssl rand -hex 32` |
+| Variable | `HF_SPACE_ID` | `<hf-username>/supporthr-classifier` |
+
+Bên API chính (Render) đặt:
+`LOCAL_CLASSIFIER_MODE=auto`, `LOCAL_CLASSIFIER_REMOTE_CLASSIFY_URL=https://<hf-username>-supporthr-classifier.hf.space/api/cv/classify-industry`,
+`LOCAL_CLASSIFIER_REMOTE_API_KEY=<CLASSIFIER_API_KEY>`.

@@ -12,10 +12,11 @@ import logging
 import math
 import os
 import re
+import secrets
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -46,6 +47,22 @@ app.add_middleware(
 _model: Any | None = None
 _model_source: str = os.getenv("MODEL_SOURCE", "remote://classifier-service")
 _model_error: str | None = None
+
+# Shared secret between cv-match-api and this service. When set (e.g. as a
+# Hugging Face Space secret), classify/status endpoints require the header
+# `X-Classifier-Key`. /health stays public for platform probes.
+_api_key: str = os.getenv("CLASSIFIER_API_KEY", "").strip()
+# The 24-sample seed model is only a demo fallback. Production (HF Space) sets
+# this to 0 so a missing trained model reports ready=false instead of serving
+# toy predictions; the main API then falls back to its bundled model.
+_allow_seed_fallback: bool = os.getenv("CLASSIFIER_ALLOW_SEED_FALLBACK", "1").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def require_api_key(x_classifier_key: str | None = Header(default=None)) -> None:
+    if not _api_key:
+        return
+    if not x_classifier_key or not secrets.compare_digest(x_classifier_key, _api_key):
+        raise HTTPException(status_code=401, detail="Invalid or missing X-Classifier-Key.")
 
 
 class ClassifyRequest(BaseModel):
@@ -98,6 +115,7 @@ def init_model(model_path: str | Path | None = None) -> None:
     import joblib
 
     resolved_path = None
+    model_path = model_path or os.getenv("MODEL_PATH") or None
     if model_path:
         candidate = Path(model_path)
         if candidate.is_file():
@@ -126,6 +144,12 @@ def init_model(model_path: str | Path | None = None) -> None:
         except Exception as err:
             logger.warning("Failed to load model from %s: %s", resolved_path, err)
             _model_error = str(err)
+
+    if not _allow_seed_fallback:
+        _model = None
+        _model_error = _model_error or "Trained model file not found and seed fallback is disabled."
+        logger.error(_model_error)
+        return
 
     logger.info("Building in-memory pipeline for 24 SupportHR industry categories...")
     try:
@@ -185,8 +209,8 @@ def health():
     return {"status": "ok", "ready": _model is not None}
 
 
-@app.get("/api/cv/classifier-status", response_model=ClassifierStatusResponse)
-@app.get("/api/classifier-status", response_model=ClassifierStatusResponse)
+@app.get("/api/cv/classifier-status", response_model=ClassifierStatusResponse, dependencies=[Depends(require_api_key)])
+@app.get("/api/classifier-status", response_model=ClassifierStatusResponse, dependencies=[Depends(require_api_key)])
 def classifier_status():
     if _model is None:
         return ClassifierStatusResponse(
@@ -206,8 +230,8 @@ def classifier_status():
     )
 
 
-@app.post("/api/cv/classify-industry", response_model=ClassifyResponse)
-@app.post("/api/classify-industry", response_model=ClassifyResponse)
+@app.post("/api/cv/classify-industry", response_model=ClassifyResponse, dependencies=[Depends(require_api_key)])
+@app.post("/api/classify-industry", response_model=ClassifyResponse, dependencies=[Depends(require_api_key)])
 def classify_industry(payload: ClassifyRequest):
     if _model is None:
         raise HTTPException(status_code=503, detail="Classifier model is not ready.")
@@ -258,9 +282,9 @@ def main():
 
     parser = argparse.ArgumentParser(description="SupportHR Classifier Microservice")
     parser.add_argument("--host", default="0.0.0.0", help="Host address")
-    parser.add_argument("--port", type=int, default=8000, help="Port number")
+    parser.add_argument("--port", type=int, default=int(os.getenv("PORT", "8000")), help="Port number")
     parser.add_argument("--model-path", help="Path to model file")
-    parser.add_argument("--model-source", default="remote://classifier-service", help="Model source identifier")
+    parser.add_argument("--model-source", default=os.getenv("MODEL_SOURCE", "remote://classifier-service"), help="Model source identifier")
     args = parser.parse_args()
 
     global _model_source
